@@ -1034,12 +1034,12 @@ class PlayerStatsDialog(QDialog):
         self.player_id = player_id
         self.player_name = player_name
         self.setWindowTitle(f"📊 {player_name} の統計")
-        self.setMinimumWidth(650)
+        self.setMinimumWidth(900)
         self.setMinimumHeight(550)
 
-        layout = QVBoxLayout()
+        outer_layout = QVBoxLayout()
 
-        # --- 登録日メッセージ ---
+        # --- 登録日メッセージ（上部に全幅で表示） ---
         stats = db.get_player_stats(player_id)
         created_at = stats.get("created_at")
         if created_at:
@@ -1052,7 +1052,7 @@ class PlayerStatsDialog(QDialog):
             greeting = QLabel(f"🎉 はじめて登録したのは {date_str} だよ！")
             greeting.setStyleSheet("font-size: 14px; padding: 6px; color: #FFD700;")
             greeting.setAlignment(Qt.AlignCenter)
-            layout.addWidget(greeting)
+            outer_layout.addWidget(greeting)
 
         # --- ランキング情報取得 ---
         ranking = db.get_ranking()
@@ -1065,7 +1065,7 @@ class PlayerStatsDialog(QDialog):
                 player_rating = r["rating"]
                 break
 
-        # --- 分析コメント ---
+        # --- 分析コメント（上部に全幅で表示） ---
         comment = self._generate_comment(stats, player_rank, total_players, player_rating)
         if comment:
             comment_label = QLabel(comment)
@@ -1075,9 +1075,13 @@ class PlayerStatsDialog(QDialog):
                 "background: rgba(255,255,255,0.07); border-radius: 8px;"
             )
             comment_label.setAlignment(Qt.AlignCenter)
-            layout.addWidget(comment_label)
+            outer_layout.addWidget(comment_label)
 
-        # --- サマリー ---
+        # ===== 左右2カラム =====
+        columns = QHBoxLayout()
+
+        # --- 左カラム: サマリー ---
+        left = QVBoxLayout()
         summary = QGroupBox("サマリー")
         form = QFormLayout()
         form.addRow("セッション数:", QLabel(str(stats["total_sessions"])))
@@ -1092,21 +1096,36 @@ class PlayerStatsDialog(QDialog):
         if player_rank is not None and total_players is not None:
             form.addRow("順位:", QLabel(f"{player_rank} / {total_players} 人中"))
         summary.setLayout(form)
-        layout.addWidget(summary)
+        left.addWidget(summary)
 
-        # --- 全セッションのマーク済みテキスト ---
+        # メモ欄（左カラム下部）
+        memo_group = QGroupBox(f"📝 {player_name} へのメモ")
+        memo_layout = QVBoxLayout()
+        self.memo_edit = QTextEdit()
+        self.memo_edit.setPlaceholderText("このプレイヤーについてメモを残せます…")
+        self.memo_edit.setMaximumHeight(100)
+        self.memo_edit.setPlainText(db.get_player_memo(player_id))
+        memo_layout.addWidget(self.memo_edit)
+        save_memo_btn = QPushButton("💾 メモを保存")
+        save_memo_btn.clicked.connect(self._save_memo)
+        memo_layout.addWidget(save_memo_btn)
+        memo_group.setLayout(memo_layout)
+        left.addWidget(memo_group)
+        left.addStretch()
+
+        # --- 右カラム: マーク済みテキスト + メモ ---
+        right = QVBoxLayout()
         sessions_data = db.get_player_marked_texts(player_id)
         if sessions_data:
             tabs = QTabWidget()
 
-            # 「全体」タブ: 全セッションのマーク済みテキストをまとめて表示
+            # 「全体」タブ
             all_tab = QWidget()
             all_layout = QVBoxLayout()
             all_texts = []
             for s in sessions_data:
                 for t in s["marked_texts"]:
                     all_texts.append(t)
-            # 重複を数えて表示
             from collections import Counter
             text_counts = Counter(all_texts)
             if text_counts:
@@ -1145,28 +1164,18 @@ class PlayerStatsDialog(QDialog):
                 tab.setLayout(tab_layout)
                 tab_label = f"{s['title']} ({s['size']}x{s['size']})"
                 tabs.addTab(tab, tab_label)
-            layout.addWidget(tabs)
+            right.addWidget(tabs)
         else:
-            layout.addWidget(QLabel("セッション履歴がありません"))
+            right.addWidget(QLabel("セッション履歴がありません"))
 
-        # --- メモ欄 ---
-        memo_group = QGroupBox(f"📝 {player_name} へのメモ")
-        memo_layout = QVBoxLayout()
-        self.memo_edit = QTextEdit()
-        self.memo_edit.setPlaceholderText("このプレイヤーについてメモを残せます…")
-        self.memo_edit.setMaximumHeight(100)
-        self.memo_edit.setPlainText(db.get_player_memo(player_id))
-        memo_layout.addWidget(self.memo_edit)
-        save_memo_btn = QPushButton("💾 メモを保存")
-        save_memo_btn.clicked.connect(self._save_memo)
-        memo_layout.addWidget(save_memo_btn)
-        memo_group.setLayout(memo_layout)
-        layout.addWidget(memo_group)
+        columns.addLayout(left, 2)
+        columns.addLayout(right, 3)
+        outer_layout.addLayout(columns)
 
         close_btn = QPushButton("閉じる")
         close_btn.clicked.connect(self.accept)
-        layout.addWidget(close_btn)
-        self.setLayout(layout)
+        outer_layout.addWidget(close_btn)
+        self.setLayout(outer_layout)
 
     def _save_memo(self):
         memo_text = self.memo_edit.toPlainText()
