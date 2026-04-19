@@ -118,6 +118,12 @@ class BingoDatabase:
         if "board_layout" not in columns:
             cursor.execute("ALTER TABLE bingo_results ADD COLUMN board_layout TEXT")
 
+        # マイグレーション: players に memo カラムが無ければ追加
+        cursor.execute("PRAGMA table_info(players)")
+        player_columns = [col[1] for col in cursor.fetchall()]
+        if "memo" not in player_columns:
+            cursor.execute("ALTER TABLE players ADD COLUMN memo TEXT DEFAULT ''")
+
         conn.commit()
         conn.close()
 
@@ -603,13 +609,43 @@ class BingoDatabase:
             cursor.execute("SELECT COUNT(*) FROM bingo_templates")
             template_count = cursor.fetchone()[0]
 
+            # 登録日を取得
+            cursor.execute("SELECT created_at FROM players WHERE player_id = ?", (player_id,))
+            row = cursor.fetchone()
+            created_at = row[0] if row else None
+
             return {
                 "total_sessions": total_sessions,
                 "total_bingo_lines": total_bingo_lines,
                 "total_marks": total_marks,
                 "total_cells": total_cells,
-                "template_count": template_count
+                "template_count": template_count,
+                "created_at": created_at
             }
+        finally:
+            conn.close()
+
+    def get_player_memo(self, player_id):
+        """プレイヤーのメモを取得"""
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        try:
+            cursor.execute("SELECT memo FROM players WHERE player_id = ?", (player_id,))
+            row = cursor.fetchone()
+            return row[0] if row and row[0] else ""
+        finally:
+            conn.close()
+
+    def save_player_memo(self, player_id, memo):
+        """プレイヤーのメモを保存"""
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        try:
+            cursor.execute(
+                "UPDATE players SET memo = ?, updated_at = CURRENT_TIMESTAMP WHERE player_id = ?",
+                (memo, player_id)
+            )
+            conn.commit()
         finally:
             conn.close()
 
@@ -996,14 +1032,52 @@ class PlayerStatsDialog(QDialog):
     def __init__(self, player_id, player_name, parent=None):
         super().__init__(parent)
         self.player_id = player_id
+        self.player_name = player_name
         self.setWindowTitle(f"📊 {player_name} の統計")
         self.setMinimumWidth(650)
-        self.setMinimumHeight(500)
+        self.setMinimumHeight(550)
 
         layout = QVBoxLayout()
 
-        # --- サマリー ---
+        # --- 登録日メッセージ ---
         stats = db.get_player_stats(player_id)
+        created_at = stats.get("created_at")
+        if created_at:
+            try:
+                from datetime import datetime
+                dt = datetime.strptime(created_at[:10], "%Y-%m-%d")
+                date_str = f"{dt.year}年{dt.month}月{dt.day}日"
+            except Exception:
+                date_str = created_at[:10]
+            greeting = QLabel(f"🎉 はじめて登録したのは {date_str} だよ！")
+            greeting.setStyleSheet("font-size: 14px; padding: 6px; color: #FFD700;")
+            greeting.setAlignment(Qt.AlignCenter)
+            layout.addWidget(greeting)
+
+        # --- ランキング情報取得 ---
+        ranking = db.get_ranking()
+        player_rank = None
+        player_rating = None
+        total_players = len(ranking)
+        for i, r in enumerate(ranking):
+            if r["player_name"] == player_name:
+                player_rank = i + 1
+                player_rating = r["rating"]
+                break
+
+        # --- 分析コメント ---
+        comment = self._generate_comment(stats, player_rank, total_players, player_rating)
+        if comment:
+            comment_label = QLabel(comment)
+            comment_label.setWordWrap(True)
+            comment_label.setStyleSheet(
+                "font-size: 13px; padding: 8px; margin: 4px 0;"
+                "background: rgba(255,255,255,0.07); border-radius: 8px;"
+            )
+            comment_label.setAlignment(Qt.AlignCenter)
+            layout.addWidget(comment_label)
+
+        # --- サマリー ---
         summary = QGroupBox("サマリー")
         form = QFormLayout()
         form.addRow("セッション数:", QLabel(str(stats["total_sessions"])))
@@ -1013,6 +1087,10 @@ class PlayerStatsDialog(QDialog):
         if stats["total_cells"] > 0:
             rate = stats["total_marks"] / stats["total_cells"] * 100
             form.addRow("マーク率:", QLabel(f"{rate:.0f}%"))
+        if player_rating is not None:
+            form.addRow("レーティング:", QLabel(str(player_rating)))
+        if player_rank is not None and total_players is not None:
+            form.addRow("順位:", QLabel(f"{player_rank} / {total_players} 人中"))
         summary.setLayout(form)
         layout.addWidget(summary)
 
@@ -1071,10 +1149,103 @@ class PlayerStatsDialog(QDialog):
         else:
             layout.addWidget(QLabel("セッション履歴がありません"))
 
+        # --- メモ欄 ---
+        memo_group = QGroupBox(f"📝 {player_name} へのメモ")
+        memo_layout = QVBoxLayout()
+        self.memo_edit = QTextEdit()
+        self.memo_edit.setPlaceholderText("このプレイヤーについてメモを残せます…")
+        self.memo_edit.setMaximumHeight(100)
+        self.memo_edit.setPlainText(db.get_player_memo(player_id))
+        memo_layout.addWidget(self.memo_edit)
+        save_memo_btn = QPushButton("💾 メモを保存")
+        save_memo_btn.clicked.connect(self._save_memo)
+        memo_layout.addWidget(save_memo_btn)
+        memo_group.setLayout(memo_layout)
+        layout.addWidget(memo_group)
+
         close_btn = QPushButton("閉じる")
         close_btn.clicked.connect(self.accept)
         layout.addWidget(close_btn)
         self.setLayout(layout)
+
+    def _save_memo(self):
+        memo_text = self.memo_edit.toPlainText()
+        db.save_player_memo(self.player_id, memo_text)
+        QMessageBox.information(self, "保存完了", f"{self.player_name} のメモを保存しました ✏️")
+
+    @staticmethod
+    def _generate_comment(stats, rank=None, total_players=None, rating=None):
+        sessions = stats["total_sessions"]
+        lines = stats["total_bingo_lines"]
+        marks = stats["total_marks"]
+        cells = stats["total_cells"]
+        rate = (marks / cells * 100) if cells > 0 else 0
+
+        comments = []
+
+        # セッション数による分析
+        if sessions == 0:
+            return "🌱 まだビンゴを遊んだことがないみたい。最初の一歩を踏み出してみよう！きっと楽しいよ！"
+        elif sessions == 1:
+            comments.append("👶 はじめてのビンゴに挑戦したばかりみたい！ここからどんどんハマっていくかも？")
+        elif sessions <= 5:
+            comments.append("🔰 何回か遊んでビンゴに慣れてきた頃だよ！そろそろコツが掴めてきたかも？")
+        elif sessions <= 15:
+            comments.append("🎮 けっこう遊んでるね〜、なかなかのビンゴ好きみたい！この調子で続けていこうだよ！")
+        else:
+            comments.append("🏆 ビンゴをやり込みまくってるね！もはやビンゴマスターの称号がふさわしいかも？")
+
+        # マーク率による分析
+        if rate >= 80:
+            comments.append("🔥 マーク率がめちゃくちゃ高い！かなり積極的にチャレンジしてるみたい！このペースは本当にすごいよ！")
+        elif rate >= 50:
+            comments.append("✨ 半分以上のマスをマークしてるね！なかなかいい調子だよ！もうちょっとで完全制覇かも？")
+        elif rate >= 20:
+            comments.append("💪 マーク率はまだこれからって感じだけど、伸びしろたっぷりだよ！どんどん塗りつぶしていこう！")
+        elif cells > 0:
+            comments.append("🌟 マーク率はまだ低めだけど、コツコツ進めていけばきっと伸びるよ！焦らずいこうだよ！")
+
+        # ビンゴライン数による分析
+        if lines == 0 and sessions > 0:
+            comments.append("🎯 ビンゴラインはまだ1本も揃ってないみたい…でも大丈夫、次こそきっと揃うかも？")
+        elif lines >= 10:
+            comments.append("🎊 ビンゴライン10本突破してる！これはかなりのやり手だよ！みんなが尊敬する存在かも？")
+        elif lines >= 5:
+            comments.append("🎉 ビンゴラインが着実に増えてきてるね！この調子でどんどん揃えていけそうだよ！")
+        elif lines >= 1:
+            comments.append("🙌 ビンゴラインを達成してるね！初ビンゴの感動は忘れられないよ！次のラインも狙っていこう！")
+
+        # レート（レーティング）による分析
+        if rating is not None:
+            if rating >= 1000:
+                comments.append("💎 レートが1000を超えてる！もう伝説級のプレイヤーと言っても過言じゃないかも？")
+            elif rating >= 500:
+                comments.append("🔥 レートが500を超えてるね！周りと比べてもかなりの実力者だよ！")
+            elif rating >= 200:
+                comments.append("💫 レートが200を超えてきた！着実に力をつけてるのが数字に表れてるみたい！")
+            elif rating >= 50:
+                comments.append("🌿 レートが50を超えたところだよ！ここからグングン伸びていく時期かも？")
+            else:
+                comments.append("🌱 レートはまだ低めだけど、ここからが本番だよ！伸びしろは無限大かも？")
+
+        # 順位による分析
+        if rank is not None and total_players is not None and total_players > 0:
+            if total_players == 1:
+                comments.append("👑 今は唯一のプレイヤーだから、堂々の王者だよ！ライバルが来ても負けないようにしよう！")
+            elif rank == 1:
+                comments.append("🥇 現在なんと第1位！トップの座に君臨してるよ！この地位を守り抜こう！")
+            elif rank == 2:
+                comments.append("🥈 現在第2位！あと一歩で王座に届くところまで来てるみたい！逆転も十分ありえるかも？")
+            elif rank == 3:
+                comments.append("🥉 現在第3位で表彰台に立ってるね！ここからさらに上を目指していけるかも？")
+            elif rank <= total_players * 0.3:
+                comments.append(f"💪 現在第{rank}位！上位グループに入ってるよ！トップ争いに食い込めるポジションかも？")
+            elif rank <= total_players * 0.6:
+                comments.append(f"🎯 現在第{rank}位の中堅どころだよ！ここからじわじわ上を目指していけるかも？")
+            else:
+                comments.append(f"🚀 現在第{rank}位だけど、まだまだこれからだよ！一気に追い上げるチャンスはあるかも？")
+
+        return "\n".join(comments)
 
 
 # -----------------------
